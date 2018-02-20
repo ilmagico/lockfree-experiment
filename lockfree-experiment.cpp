@@ -422,7 +422,7 @@ struct Params {
     int interval_ns;
 };
 
-template <template<class> typename Queue>
+template <template<class> class Queue>
 void run_test(const Params& p)
 {
     Queue<Payload> q;
