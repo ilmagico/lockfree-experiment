@@ -419,7 +419,7 @@ struct Params {
     int num_threads;
     int num_produces;
     int sleep_us;
-    int interval_us;
+    int interval_ns;
 };
 
 template <template<class> typename Queue>
@@ -455,12 +455,15 @@ void run_test(const Params& p)
             std::random_device r;
             std::default_random_engine rnd(r());
             std::uniform_int_distribution<int> data_dist(1, 10000);
-            std::uniform_int_distribution<int> interval_dist(1, p.interval_us);
+            std::uniform_int_distribution<int> interval_dist(0, p.interval_ns);
             for (int k = 0; !quit && k < p.num_produces; k++) {
                 // randomly sleep for some time
-                if (p.interval_us > 0) {
-                    auto intv = std::chrono::microseconds(interval_dist(rnd));
-                    std::this_thread::sleep_for(intv);
+                if (p.interval_ns > 0) {
+                    int ns = interval_dist(rnd);
+                    if (ns > 0) {
+                        auto intv = std::chrono::nanoseconds(ns);
+                        std::this_thread::sleep_for(intv);
+                    }
                 }
                 // produce some random data
                 Payload data = make_payload([&]() { return data_dist(rnd); });
@@ -517,8 +520,8 @@ int main(int argc, char** argv)
         ("sleep,s", po::value<int>(&p.sleep_us)->default_value(0),
          "Microseconds consumer will sleep after emptying the queue "
          "to reduce cpu usage, zero disables sleeping")
-        ("interval,i", po::value<int>(&p.interval_us)->default_value(10),
-         "Maximum amount of microseconds producer will sleep after pushing "
+        ("interval,i", po::value<int>(&p.interval_ns)->default_value(1000),
+         "Maximum amount of nanoseconds producer will sleep after pushing "
          "one element to the queue. Value is randomized between 0 and this.")
         ;
 
