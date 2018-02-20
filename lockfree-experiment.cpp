@@ -10,20 +10,22 @@
 #include <cassert>
 
 #include <boost/lockfree/queue.hpp>
+#include <boost/program_options.hpp>
 
 #include "lockfree_ptr_queue.hpp"
 
 
-//#define USE_LOCKFREE
-#define THROTTLE_CONSUMER 100
+// This decides which implementation of Queue we should use,
+// the locking one or lockfree one.
+#define USE_LOCKFREE
 
-// High contention scenario
-//static constexpr int NUM_THREADS = 500;
-//static constexpr int NUM_PRODUCES = 20000;
-// Low contention
-static constexpr int NUM_THREADS = 50;
-static constexpr int NUM_PRODUCES = 200000;
+// This can be used to disable tracing entirely at compile-time,
+// although there's little use for this now that tracing is a command
+// line option, and timing difference between compile-time and
+// run-time disabling is not measurable.
+#define DBG_TRACE
 
+// Test Payload to push/pop in the queue
 struct Payload
 {
     int stuff[4];
@@ -39,7 +41,9 @@ template <typename Gen> Payload make_payload(Gen&& g)
 }
 
 
-//#define DBG_TRACE
+
+// if DBG_TRACE is enabled, it can still be disabled at runtime
+static bool trace_enabled;
 
 // Taken from: https://stackoverflow.com/a/44886145
 // replaced slow divide loop with modulo operator
@@ -73,6 +77,9 @@ public:
     typedef std::chrono::high_resolution_clock clock;
     clock::time_point timestamp;
     TraceEventBase() : timestamp(clock::now()) { }
+    // if this returns true, it means the constructor will
+    // print the message immediately, as well as when it gets popped
+    static constexpr bool immediate = false;
 };
 
 template <typename OStream, typename TraceEv>
@@ -99,6 +106,7 @@ public:
     {
         std::cerr << *this << std::endl;
     }
+    static constexpr bool immediate = true;
 };
 
 
@@ -137,6 +145,7 @@ public:
     {
         std::cerr << *this << std::endl;
     }
+    static constexpr bool immediate = true;
 };
 
 
@@ -170,7 +179,12 @@ LockfreePtrQueue<event_t> traceq;
 template <typename Event = MessageEvent, typename... Args>
 void trace(Args&&... args)
 {
-    traceq.push(Event(args...));
+    if (trace_enabled) {
+        traceq.push(Event(args...));
+    } else if (Event::immediate) {
+        // constructor has side effects, call it
+        Event(args...);
+    }
 }
 
 class trace_get_message : public boost::static_visitor<>
@@ -414,8 +428,49 @@ void exit_handler(int s){
     quit = true;
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
+    int num_threads;
+    int num_produces;
+    int sleep_us;
+    int interval_us;
+
+    namespace po = boost::program_options;
+
+    std::string help_text = "Usage: lockfree-experiment [options]\n\n";
+    po::options_description options_desc("General options");
+    options_desc.add_options()
+        ("help,h", "Print help")
+        ("trace,t", "Enable tracing all operations in a memory buffer, "
+         "which is dumped on stdout at the end of the test.")
+        ("num-treads,n", po::value<int>(&num_threads)->default_value(50),
+         "How many producer threads to spawn (consumer is only one)")
+        ("num-produces,p", po::value<int>(&num_produces)->default_value(200000),
+         "How many element producers should push to the queue (each)")
+        ("sleep,s", po::value<int>(&sleep_us)->default_value(0),
+         "Microseconds consumer will sleep after emptying the queue "
+         "to reduce cpu usage, zero disables sleeping")
+        ("interval,i", po::value<int>(&interval_us)->default_value(10),
+         "Maximum amount of microseconds producer will sleep after pushing "
+         "one element to the queue. Value is randomized between 0 and this.")
+        ;
+
+    po::variables_map opts;
+    po::store(po::command_line_parser(argc, argv)
+            .options(options_desc).run(), opts);
+
+    if (opts.count("help")) {
+        std::cout << help_text << options_desc << "\n";
+        return 0;
+    }
+    po::notify(opts);
+
+    if (opts.count("trace") > 0) {
+        trace_enabled = true;
+    } else {
+        trace_enabled = false;
+    }
+
     struct sigaction sigact;
 
     sigact.sa_handler = exit_handler;
@@ -429,16 +484,16 @@ int main(void)
 
     auto start_ts = std::chrono::steady_clock::now();
 
-    std::thread consumer([&q]() {
+    std::thread consumer([=,&q]() {
         // 'tis the consumer thread
+        auto interval = std::chrono::microseconds(sleep_us);
         int cnt = 0;
         while (!quit) {
             // wait for data
             TRACE(EmptyQueue, cnt);
-            #ifdef THROTTLE_CONSUMER
-            auto interval = std::chrono::milliseconds(THROTTLE_CONSUMER);
-            std::this_thread::sleep_for(interval);
-            #endif
+            if (sleep_us > 0) {
+                std::this_thread::sleep_for(interval);
+            }
             q.wait();
             cnt = 0;
             Payload elem;
@@ -450,19 +505,19 @@ int main(void)
     });
 
     std::vector<std::thread> producers;
-    for (int i = 0; i < NUM_THREADS; i++) {
-        producers.emplace_back([&q] () {
-            for (int k = 0; !quit && k < NUM_PRODUCES; k++) {
-            //while (!quit) {
-                std::random_device r;
-                std::default_random_engine rnd(r());
+    for (int i = 0; i < num_threads; i++) {
+        producers.emplace_back([=,&q] () {
+            std::random_device r;
+            std::default_random_engine rnd(r());
+            std::uniform_int_distribution<int> data_dist(1, 10000);
+            std::uniform_int_distribution<int> interval_dist(1, interval_us);
+            for (int k = 0; !quit && k < num_produces; k++) {
                 // randomly sleep for some time
-                std::uniform_int_distribution<int> dist(1, 100);
-                auto interval = std::chrono::nanoseconds(dist(rnd));
-                std::this_thread::sleep_for(interval);
+                if (interval_us > 0) {
+                    auto interval = std::chrono::microseconds(interval_dist(rnd));
+                    std::this_thread::sleep_for(interval);
+                }
                 // produce some random data
-                std::uniform_int_distribution<int> data_dist(1, 100);
-                //int data = data_dist(rnd);
                 Payload data = make_payload([&]() { return data_dist(rnd); });
                 TRACE(Message, "-> push elem");
                 q.push(data);
@@ -496,4 +551,6 @@ int main(void)
     }
 
     dump_trace();
+
+    return 0;
 }
