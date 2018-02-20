@@ -10,5 +10,5 @@ There are some command-line options to experiment with (use `-h` to see them), a
 ## Bench
 Make sure to disable tracing (comment `#define DBG_TRACE`), then you can run the executable with `time`, or use the `timeit.sh` script which does that for you and print some useful metrics, e.g.:
 ```
-./timeit.sh -N 50 -i 1 -s 100000
+./timeit.sh -n 50 -i 1 -s 100000
 ```
