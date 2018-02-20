@@ -8,16 +8,15 @@
 #include <chrono>
 #include <condition_variable>
 #include <cassert>
+#include <queue>
+
+#include <signal.h>
 
 #include <boost/lockfree/queue.hpp>
 #include <boost/program_options.hpp>
 
 #include "lockfree_ptr_queue.hpp"
 
-
-// This decides which implementation of Queue we should use,
-// the locking one or lockfree one.
-#define USE_LOCKFREE
 
 // This can be used to disable tracing entirely at compile-time,
 // although there's little use for this now that tracing is a command
@@ -260,8 +259,6 @@ void dump_trace() { }
 #define TRACE(EventType, ...) trace<EventType##Event>(__VA_ARGS__)
 
 
-#ifdef USE_LOCKFREE
-
 class WaitFlag
 {
     std::atomic<bool> m_flag;
@@ -312,13 +309,13 @@ public:
 
 
 template <typename T>
-class Queue
+class LockfreeQueue
 {
     boost::lockfree::queue<T> m_q;
     WaitFlag m_flag;
 
 public:
-    Queue() : m_q(0) { }
+    LockfreeQueue() : m_q(0) { }
 
     bool push(const T& x) {
         bool ret = m_q.push(x);
@@ -344,13 +341,9 @@ public:
 
 };
 
-#else
-
-#include <queue>
-
 // plain old queue + mutex, for comparison
 template <typename T>
-class Queue
+class LockingQueue
 {
     std::mutex m_mtx;
     std::condition_variable m_event;
@@ -413,12 +406,6 @@ public:
     }
 };
 
-#endif
-
-
-#include <signal.h>
-#include <stdlib.h>
-#include <stdio.h>
 
 std::atomic<bool> quit;
 
@@ -428,70 +415,28 @@ void exit_handler(int s){
     quit = true;
 }
 
-int main(int argc, char** argv)
-{
+struct Params {
     int num_threads;
     int num_produces;
     int sleep_us;
     int interval_us;
+};
 
-    namespace po = boost::program_options;
-
-    std::string help_text = "Usage: lockfree-experiment [options]\n\n";
-    po::options_description options_desc("General options");
-    options_desc.add_options()
-        ("help,h", "Print help")
-        ("trace,t", "Enable tracing all operations in a memory buffer, "
-         "which is dumped on stdout at the end of the test.")
-        ("num-treads,n", po::value<int>(&num_threads)->default_value(50),
-         "How many producer threads to spawn (consumer is only one)")
-        ("num-produces,p", po::value<int>(&num_produces)->default_value(200000),
-         "How many element producers should push to the queue (each)")
-        ("sleep,s", po::value<int>(&sleep_us)->default_value(0),
-         "Microseconds consumer will sleep after emptying the queue "
-         "to reduce cpu usage, zero disables sleeping")
-        ("interval,i", po::value<int>(&interval_us)->default_value(10),
-         "Maximum amount of microseconds producer will sleep after pushing "
-         "one element to the queue. Value is randomized between 0 and this.")
-        ;
-
-    po::variables_map opts;
-    po::store(po::command_line_parser(argc, argv)
-            .options(options_desc).run(), opts);
-
-    if (opts.count("help")) {
-        std::cout << help_text << options_desc << "\n";
-        return 0;
-    }
-    po::notify(opts);
-
-    if (opts.count("trace") > 0) {
-        trace_enabled = true;
-    } else {
-        trace_enabled = false;
-    }
-
-    struct sigaction sigact;
-
-    sigact.sa_handler = exit_handler;
-    sigemptyset(&sigact.sa_mask);
-    sigact.sa_flags = SA_RESETHAND;
-
-    sigaction(SIGINT, &sigact, NULL);
-    sigaction(SIGTERM, &sigact, NULL);
-
+template <template<class> typename Queue>
+void run_test(const Params& p)
+{
     Queue<Payload> q;
 
     auto start_ts = std::chrono::steady_clock::now();
 
-    std::thread consumer([=,&q]() {
+    std::thread consumer([p,&q]() {
         // 'tis the consumer thread
-        auto interval = std::chrono::microseconds(sleep_us);
+        auto interval = std::chrono::microseconds(p.sleep_us);
         int cnt = 0;
         while (!quit) {
             // wait for data
             TRACE(EmptyQueue, cnt);
-            if (sleep_us > 0) {
+            if (p.sleep_us > 0) {
                 std::this_thread::sleep_for(interval);
             }
             q.wait();
@@ -505,17 +450,17 @@ int main(int argc, char** argv)
     });
 
     std::vector<std::thread> producers;
-    for (int i = 0; i < num_threads; i++) {
-        producers.emplace_back([=,&q] () {
+    for (int i = 0; i < p.num_threads; i++) {
+        producers.emplace_back([p,&q] () {
             std::random_device r;
             std::default_random_engine rnd(r());
             std::uniform_int_distribution<int> data_dist(1, 10000);
-            std::uniform_int_distribution<int> interval_dist(1, interval_us);
-            for (int k = 0; !quit && k < num_produces; k++) {
+            std::uniform_int_distribution<int> interval_dist(1, p.interval_us);
+            for (int k = 0; !quit && k < p.num_produces; k++) {
                 // randomly sleep for some time
-                if (interval_us > 0) {
-                    auto interval = std::chrono::microseconds(interval_dist(rnd));
-                    std::this_thread::sleep_for(interval);
+                if (p.interval_us > 0) {
+                    auto intv = std::chrono::microseconds(interval_dist(rnd));
+                    std::this_thread::sleep_for(intv);
                 }
                 // produce some random data
                 Payload data = make_payload([&]() { return data_dist(rnd); });
@@ -548,6 +493,66 @@ int main(int argc, char** argv)
 
     if (!q.empty()) {
         TRACE(MessageNow, "QUEUE STILL NOT EMPTY! CONSUMER STARVED?");
+    }
+}
+
+int main(int argc, char** argv)
+{
+    Params p;
+
+    namespace po = boost::program_options;
+
+    std::string help_text = "Usage: lockfree-experiment [options]\n\n";
+    po::options_description options_desc("General options");
+    options_desc.add_options()
+        ("help,h", "Print help")
+        ("trace,t", "Enable tracing all operations in a memory buffer, "
+         "which is dumped on stdout at the end of the test.")
+        ("locking,l", "Disable lockfree queue and use a standard "
+         "std::queue + std::mutex instead, for comparison.")
+        ("num-treads,n", po::value<int>(&p.num_threads)->default_value(50),
+         "How many producer threads to spawn (consumer is only one)")
+        ("num-produces,p", po::value<int>(&p.num_produces)->default_value(200000),
+         "How many element producers should push to the queue (each)")
+        ("sleep,s", po::value<int>(&p.sleep_us)->default_value(0),
+         "Microseconds consumer will sleep after emptying the queue "
+         "to reduce cpu usage, zero disables sleeping")
+        ("interval,i", po::value<int>(&p.interval_us)->default_value(10),
+         "Maximum amount of microseconds producer will sleep after pushing "
+         "one element to the queue. Value is randomized between 0 and this.")
+        ;
+
+    po::variables_map opts;
+    po::store(po::command_line_parser(argc, argv)
+            .options(options_desc).run(), opts);
+
+    if (opts.count("help")) {
+        std::cout << help_text << options_desc << "\n";
+        return 0;
+    }
+    po::notify(opts);
+
+    if (opts.count("trace") > 0) {
+        trace_enabled = true;
+    } else {
+        trace_enabled = false;
+    }
+
+    struct sigaction sigact;
+
+    sigact.sa_handler = exit_handler;
+    sigemptyset(&sigact.sa_mask);
+    sigact.sa_flags = SA_RESETHAND;
+
+    sigaction(SIGINT, &sigact, NULL);
+    sigaction(SIGTERM, &sigact, NULL);
+
+    if (opts.count("locking") > 0) {
+        TRACE(MessageNow, "Using Locking queue");
+        run_test<LockingQueue>(p);
+    } else {
+        TRACE(MessageNow, "Using Lock-free queue");
+        run_test<LockfreeQueue>(p);
     }
 
     dump_trace();
