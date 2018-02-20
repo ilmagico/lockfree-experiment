@@ -7,8 +7,9 @@
 #include <mutex>
 #include <chrono>
 #include <condition_variable>
-#include <boost/lockfree/queue.hpp>
 #include <cassert>
+
+#include <boost/lockfree/queue.hpp>
 
 #include "lockfree_ptr_queue.hpp"
 
@@ -60,81 +61,6 @@ std::ostream &operator<<(
     typename Duration::duration ago = timepoint.time_since_epoch();
     return stream << ago;
 }
-
-
-#define DBG_KIND_IMMEDIATE 0
-#define DBG_KIND_QUEUE     1
-#define DBG_KIND_NULL      2
-
-#define DBG_KIND DBG_KIND_NULL
-
-#if DBG_KIND == DBG_KIND_IMMEDIATE
-std::mutex iomtx;
-
-void syncout(const std::string& str)
-{
-    std::unique_lock<std::mutex> lock(iomtx);
-    std::cout << str << std::endl;
-    std::cout.flush();
-}
-
-void print_all_messages() { }
-
-#define DBG(stuff) \
-    do { \
-        std::ostringstream os; \
-        os << stuff; \
-        syncout(std::move(os.str())); \
-    } while (false)
-
-#elif DBG_KIND == DBG_KIND_QUEUE
-
-#include <tuple>
-
-using boost::optional;
-using std::unique_ptr;
-
-typedef std::chrono::high_resolution_clock msgclock;
-
-LockfreePtrQueue<std::tuple<msgclock::time_point, std::string>> g_msgq;
-
-void syncout(std::string&& s)
-{
-    g_msgq.push(std::make_tuple(msgclock::now(), std::move(s)));
-}
-
-
-void print_all_messages()
-{
-    boost::optional<msgclock::time_point> start_ts;
-    while (auto msg = g_msgq.pop()) {
-        msgclock::time_point ts;
-        if (!start_ts) {
-            // use first timestamp as start time
-            // TODO: print full starting time as YY:mm:DD MM:HH:SS or something
-            start_ts = std::get<0>(*msg);
-        } else {
-            ts = std::get<0>(*msg);
-        }
-        std::string str = std::get<1>(*msg);
-        std::cout << (ts - *start_ts) << ": " << str << std::endl;
-    }
-}
-
-#define DBG(stuff) \
-    do { \
-        std::ostringstream os; \
-        os << stuff; \
-        syncout(std::move(os.str())); \
-    } while (false)
-
-#elif DBG_KIND == DBG_KIND_NULL
-
-void syncout(std::string) { }
-void print_all_messages() { }
-#define DBG(...)
-
-#endif
 
 
 #ifdef DBG_TRACE
@@ -569,6 +495,5 @@ int main(void)
         TRACE(MessageNow, "QUEUE STILL NOT EMPTY! CONSUMER STARVED?");
     }
 
-    print_all_messages();
     dump_trace();
 }
