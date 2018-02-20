@@ -523,14 +523,19 @@ int main(int argc, char** argv)
         ;
 
     po::variables_map opts;
-    po::store(po::command_line_parser(argc, argv)
-            .options(options_desc).run(), opts);
+    try {
+        po::store(po::command_line_parser(argc, argv)
+                .options(options_desc).run(), opts);
+        po::notify(opts);
+    } catch (std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return 1;
+    }
 
     if (opts.count("help")) {
         std::cout << help_text << options_desc << "\n";
         return 0;
     }
-    po::notify(opts);
 
     if (opts.count("trace") > 0) {
         trace_enabled = true;
